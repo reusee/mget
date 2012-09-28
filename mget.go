@@ -5,20 +5,66 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net"
-	http "github.com/mreiferson/go-httpclient"
+	httpc "github.com/mreiferson/go-httpclient"
 	"runtime"
 	"strings"
 	"time"
+	"net/http"
 )
 
 var PoolSize = 30
 
-func collect(url string) []byte {
-	client := http.New()
+func StartCollector() *Collector {
+	Input := make(chan *CollectJob)
+	SetCookieChan := make(chan string)
+	cookie := make([]*http.Cookie, 0)
+	setCookie := func(str string) {
+		cookie = make([]*http.Cookie, 0)
+		for _, part := range strings.Split(str, ";") {
+			pair := strings.Split(part, "=")
+			name, value := strings.TrimSpace(pair[0]), strings.TrimSpace(pair[1])
+			cookie = append(cookie, &http.Cookie{Name: name, Value: value})
+		}
+	}
+	go func() {
+		for {
+			select {
+			case job := <-Input:
+				go func() {
+					content := collect(job.url, cookie)
+					job.ret <- content
+				}()
+			case cookieStr := <-SetCookieChan:
+				setCookie(cookieStr)
+			}
+		}
+	}()
+	return &Collector{Input, SetCookieChan}
+}
+
+type Collector struct {
+	Input chan *CollectJob
+	SetCookie chan string
+}
+
+type CollectJob struct {
+	url string
+	ret chan []byte
+}
+
+func collect(url string, cookies []*http.Cookie) []byte {
+	client := httpc.New()
 	client.ConnectTimeout = time.Second * 30
 	client.ReadWriteTimeout = time.Second * 30
 	retry := 5
-start: resp, err := client.Get(url)
+	request, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return []byte("")
+	}
+	for _, cookie := range cookies {
+		request.AddCookie(cookie)
+	}
+start: resp, err := client.Do(request)
 	if resp != nil {
 		defer resp.Body.Close()
 	}
@@ -41,25 +87,25 @@ start: resp, err := client.Get(url)
 }
 
 type Content struct {
-	url     string
-	content []byte
+	Url     string
+	Content []byte
 }
 
-func StartStorage() (storeChan chan *Content) {
-	storeChan = make(chan *Content)
+func StartStorage() (StoreChan chan *Content) {
+	StoreChan = make(chan *Content)
 	go func() {
 		for {
-			content := <-storeChan
+			content := <-StoreChan
 			fmt.Printf("received: %s, length %d\n",
-				content.url,
-				len(content.content))
+				content.Url,
+				len(content.Content))
 		}
 	}()
-	return storeChan
+	return StoreChan
 }
 
-func StartScheduler(storage chan *Content) (schedChan chan string) {
-	schedChan = make(chan string)
+func StartScheduler(storage chan *Content, collector *Collector) (SchedChan chan string) {
+	SchedChan = make(chan string)
 	go func() {
 		jobs := make([]string, 0)
 		semaphore := make(chan bool, PoolSize)
@@ -87,7 +133,9 @@ func StartScheduler(storage chan *Content) (schedChan chan string) {
 					semaphore <- true
 					doneChan <- true
 				}()
-				content := collect(url)
+				ret := make(chan []byte)
+				collector.Input <- &CollectJob{url, ret}
+				content := <-ret
 				storage <- &Content{url, content}
 			}(url)
 		}
@@ -101,7 +149,7 @@ func StartScheduler(storage chan *Content) (schedChan chan string) {
 		for {
 			if len(jobs) > 0 {
 				select {
-				case url = <-schedChan:
+				case url = <-SchedChan:
 					addJob(url)
 				case <-doneChan:
 					doneJob()
@@ -112,7 +160,7 @@ func StartScheduler(storage chan *Content) (schedChan chan string) {
 				}
 			} else {
 				select {
-				case url = <-schedChan:
+				case url = <-SchedChan:
 					addJob(url)
 				case <-doneChan:
 					doneJob()
@@ -122,7 +170,7 @@ func StartScheduler(storage chan *Content) (schedChan chan string) {
 			}
 		}
 	}()
-	return schedChan
+	return SchedChan
 }
 
 func StartSocket(schedChan chan string) {
@@ -151,14 +199,31 @@ func StartSocket(schedChan chan string) {
 }
 
 func StartChan(schedChan chan string) chan string {
-	input := make(chan string)
+	Input := make(chan string)
 	go func() {
 		var url string
 		for {
-			url = <-input
+			url = <-Input
 			url = strings.TrimSpace(url)
 			schedChan <- url
 		}
 	}()
-	return input
+	return Input
+}
+
+func NewChannelMget() *ChannelMget {
+  collector := StartCollector()
+  response := make(chan *Content, 2048)
+  request := StartChan(StartScheduler(response, collector))
+  return &ChannelMget{
+    Collector: collector,
+    Request: request,
+    Response: response,
+  }
+}
+
+type ChannelMget struct {
+  Collector *Collector
+  Request chan string
+  Response chan *Content
 }

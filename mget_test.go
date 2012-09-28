@@ -13,11 +13,11 @@ func TestMget(t *testing.T) {
 	go func() {
 		for i := 0; i < n; i++ {
 			content := <-contentChan
-			fmt.Printf("fetch %s, len %d\n", content.url, len(content.content))
+			fmt.Printf("fetch %s, len %d\n", content.Url, len(content.Content))
 		}
 		end <- true
 	}()
-	go StartSocket(StartScheduler(contentChan))
+	go StartSocket(StartScheduler(contentChan, StartCollector()))
 	conn, err := net.Dial("tcp", "localhost:43210")
 	if err != nil {
 		panic(err)
@@ -26,4 +26,10 @@ func TestMget(t *testing.T) {
 		fmt.Fprintf(conn, "http://www.qq.com\n")
 	}
 	<-end
+}
+
+func TestChannelMget(t *testing.T) {
+  mget := NewChannelMget()
+  mget.Request <- "http://www.qq.com"
+  <-mget.Response
 }
