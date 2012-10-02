@@ -4,9 +4,11 @@ import (
 	"testing"
 	"net"
 	"fmt"
+	iconv "github.com/reusee/go-iconv"
 )
 
 func TestMget(t *testing.T) {
+  Verbose = true
 	end := make(chan bool)
 	contentChan := make(chan *Content)
 	n := 50
@@ -29,7 +31,23 @@ func TestMget(t *testing.T) {
 }
 
 func TestChannelMget(t *testing.T) {
+  Verbose = true
   mget := NewChannelMget()
-  mget.Request <- "http://www.qq.com"
-  <-mget.Response
+  mget.Collector.SetHeader <- map[string]string{
+    "Referer": "hehe",
+  }
+  n := 100
+  for i := 0; i < n; i++ {
+    mget.Request <- "http://www.qq.com"
+  }
+  for i := 0; i < n; i++ {
+    res := <-mget.Response
+    gbk2utf8(res.Content)
+  }
+}
+
+func gbk2utf8(input []byte) ([]byte, error) {
+	cd, _ := iconv.Open("utf8//IGNORE", "gbk")
+  defer cd.Close()
+	return cd.Conv(input)
 }

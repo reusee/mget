@@ -5,14 +5,18 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net"
-	httpc "github.com/mreiferson/go-httpclient"
 	"runtime"
 	"strings"
 	"time"
 	"net/http"
 )
 
-var PoolSize = 30
+var (
+  PoolSize = 30
+  Timeout = time.Second * 10
+  Retry = 5
+  Verbose = false
+)
 
 func StartCollector() *Collector {
 	Input := make(chan *CollectJob)
@@ -26,82 +30,107 @@ func StartCollector() *Collector {
 			cookie = append(cookie, &http.Cookie{Name: name, Value: value})
 		}
 	}
+  SetHeaderChan := make(chan map[string]string)
+  headers := make(map[string]string)
+  setHeader := func(hs map[string]string) {
+    for k, v := range hs {
+      headers[k] = v
+    }
+  }
+  transport := &http.Transport {
+    Dial: func(netw, addr string) (conn net.Conn, err error) {
+      conn, err = net.Dial(netw, addr)
+      if conn != nil {
+        conn.SetDeadline(time.Now().Add(Timeout))
+        conn.SetReadDeadline(time.Now().Add(Timeout).Add(Timeout))
+      } else {
+        fmt.Printf("dial error%v\n", err)
+      }
+      return conn, err
+    },
+  }
 	go func() {
 		for {
 			select {
 			case job := <-Input:
+        verbose(fmt.Sprintf("Collector new job %s", job.url))
 				go func() {
-					content := collect(job.url, cookie)
-					job.ret <- content
+					content, err := collect(job.url, cookie, headers, transport)
+					job.ret <- &JobReturn{content, err}
 				}()
 			case cookieStr := <-SetCookieChan:
 				setCookie(cookieStr)
+      case headers := <-SetHeaderChan:
+        setHeader(headers)
 			}
 		}
 	}()
-	return &Collector{Input, SetCookieChan}
+	return &Collector{Input, SetCookieChan, SetHeaderChan}
 }
 
 type Collector struct {
 	Input chan *CollectJob
 	SetCookie chan string
+	SetHeader chan map[string]string
+}
+
+type JobReturn struct {
+  content []byte
+  err error
 }
 
 type CollectJob struct {
 	url string
-	ret chan []byte
+	ret chan *JobReturn
 }
 
-func collect(url string, cookies []*http.Cookie) []byte {
-	client := httpc.New()
-	client.ConnectTimeout = time.Second * 30
-	client.ReadWriteTimeout = time.Second * 30
-	retry := 5
+func collect(url string, cookies []*http.Cookie, headers map[string]string, transport *http.Transport) ([]byte, error) {
+  defer transport.CloseIdleConnections()
+	retry := Retry
 	request, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		return []byte("")
+		return []byte(""), err
 	}
 	for _, cookie := range cookies {
 		request.AddCookie(cookie)
 	}
-start: resp, err := client.Do(request)
-	if resp != nil {
-		defer resp.Body.Close()
-	}
+  for k, v := range headers {
+    request.Header.Add(k, v)
+  }
+start:
+  client := http.Client {
+    Transport: transport,
+  }
+  resp, err := client.Do(request)
+  if resp != nil {
+    defer resp.Body.Close()
+  }
 	if err != nil {
 		if retry > 0 {
+		  verbose(fmt.Sprintf("Collector request retry %d %s", retry, url))
 			retry--
 			goto start
 		}
-		return []byte("")
+		verbose(fmt.Sprintf("Collector empty response %s", url))
+		return []byte(""), err
 	}
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		if retry > 0 {
+		  verbose(fmt.Sprintf("Collector read retry %d %s", retry, url))
 			retry--
 			goto start
 		}
-		return []byte("")
+		verbose(fmt.Sprintf("Collector empty read %s", url))
+		return []byte(""), err
 	}
-	return body
+	return body, err
 }
 
 type Content struct {
 	Url     string
 	Content []byte
-}
-
-func StartStorage() (StoreChan chan *Content) {
-	StoreChan = make(chan *Content)
-	go func() {
-		for {
-			content := <-StoreChan
-			fmt.Printf("received: %s, length %d\n",
-				content.Url,
-				len(content.Content))
-		}
-	}()
-	return StoreChan
+	Err error
 }
 
 func StartScheduler(storage chan *Content, collector *Collector) (SchedChan chan string) {
@@ -115,28 +144,30 @@ func StartScheduler(storage chan *Content, collector *Collector) (SchedChan chan
 		var url string
 		var total, done, delta uint
 		var sysmem uint64
-		doneChan := make(chan bool)
+		doneChan := make(chan string)
 		ticker := time.NewTicker(time.Second * 1)
 		memstats := new(runtime.MemStats)
 		addJob := func(url string) {
-			fmt.Printf("add: %s\n", url)
 			jobs = append(jobs, url)
 			total++
+			//verbose(fmt.Sprintf("Scheduler add job %s", url))
 		}
-		doneJob := func() {
+		doneJob := func(url string) {
 			done++
+			verbose(fmt.Sprintf("Scheduler done job %s", url))
 		}
 		doJob := func() {
 			url, jobs = jobs[len(jobs)-1], jobs[:len(jobs)-1]
+			verbose(fmt.Sprintf("Scheduler start job %s", url))
 			go func(url string) {
 				defer func() {
 					semaphore <- true
-					doneChan <- true
+					doneChan <- url
 				}()
-				ret := make(chan []byte)
+				ret := make(chan *JobReturn)
 				collector.Input <- &CollectJob{url, ret}
-				content := <-ret
-				storage <- &Content{url, content}
+				jobRet := <-ret
+				storage <- &Content{url, jobRet.content, jobRet.err}
 			}(url)
 		}
 		showStat := func() {
@@ -151,8 +182,8 @@ func StartScheduler(storage chan *Content, collector *Collector) (SchedChan chan
 				select {
 				case url = <-SchedChan:
 					addJob(url)
-				case <-doneChan:
-					doneJob()
+				case url = <-doneChan:
+					doneJob(url)
 				case <-semaphore:
 					doJob()
 				case <-ticker.C:
@@ -162,8 +193,8 @@ func StartScheduler(storage chan *Content, collector *Collector) (SchedChan chan
 				select {
 				case url = <-SchedChan:
 					addJob(url)
-				case <-doneChan:
-					doneJob()
+				case url = <-doneChan:
+					doneJob(url)
 				case <-ticker.C:
 					showStat()
 				}
@@ -226,4 +257,10 @@ type ChannelMget struct {
   Collector *Collector
   Request chan string
   Response chan *Content
+}
+
+func verbose(s string) {
+  if Verbose {
+    fmt.Printf("======== Verbose ======== %s\n", s)
+  }
 }
