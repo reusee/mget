@@ -244,7 +244,7 @@ func StartChan(schedChan chan string) chan string {
 
 func NewChannelMget() *ChannelMget {
   collector := StartCollector()
-  response := make(chan *Content, 2048)
+  response := make(chan *Content, PoolSize)
   request := StartChan(StartScheduler(response, collector))
   return &ChannelMget{
     Collector: collector,
