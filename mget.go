@@ -13,6 +13,7 @@ import (
 
 var (
   PoolSize = 30
+  CacheSize = 30
   Timeout = time.Second * 10
   Retry = 5
   Verbose = false
@@ -244,7 +245,7 @@ func StartChan(schedChan chan string) chan string {
 
 func NewChannelMget() *ChannelMget {
   collector := StartCollector()
-  response := make(chan *Content, PoolSize)
+  response := make(chan *Content, CacheSize)
   request := StartChan(StartScheduler(response, collector))
   return &ChannelMget{
     Collector: collector,
